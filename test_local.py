@@ -9,6 +9,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 import app as mcp_entry
 from server import (
     download_assignment_file,
@@ -29,7 +31,7 @@ def parse_json(label: str, text: str) -> Any:
 
 def print_json(label: str, value: Any) -> None:
     print(f"\n===== {label} =====")
-    print(json.dumps(value, ensure_ascii=False, indent=2))
+    print(json.dumps(value, ensure_ascii=False, indent=2), flush=True)
 
 
 def require_credentials() -> tuple[str, str]:

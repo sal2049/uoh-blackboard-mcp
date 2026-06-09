@@ -22,11 +22,15 @@ except ImportError:  # pragma: no cover - python-dotenv is optional at import ti
     load_dotenv = None
 
 
+if load_dotenv is not None:
+    load_dotenv(Path(__file__).with_name(".env"))
+
 BASE_URL = "https://uoh.blackboard.com/"
 LOGIN_URL = urljoin(BASE_URL, "webapps/login/")
 LOOKAHEAD_DAYS = int(os.getenv("UOH_LOOKAHEAD_DAYS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("UOH_TIMEOUT", "25"))
 MAX_CONTENT_ITEMS_PER_COURSE = int(os.getenv("UOH_MAX_CONTENT_ITEMS_PER_COURSE", "250"))
+COURSE_SCAN_LIMIT = int(os.getenv("UOH_COURSE_SCAN_LIMIT", "25"))
 SSE_FLUSH_BYTES = int(os.getenv("UOH_SSE_FLUSH_BYTES", "131072"))
 WORK_KEYWORDS = (
     "assignment",
@@ -190,6 +194,7 @@ class BlackboardClient:
             )
 
         self.session = requests.Session()
+        self.authenticated = False
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -201,10 +206,17 @@ class BlackboardClient:
         )
 
     def login(self) -> None:
+        if self.authenticated:
+            return
+
         landing = self.get(LOGIN_URL)
         form = self.find_login_form(landing.text)
         if form is None:
-            form = self.find_login_form(self.get(BASE_URL).text)
+            home = self.get(BASE_URL)
+            if self.looks_authenticated(home):
+                self.authenticated = True
+                return
+            form = self.find_login_form(home.text)
         if form is None:
             raise BlackboardError("Could not find a Blackboard login form.")
 
@@ -229,15 +241,19 @@ class BlackboardClient:
         probe = self.session.get(urljoin(BASE_URL, "learn/api/public/v1/courses?limit=1"), timeout=REQUEST_TIMEOUT)
         if probe.status_code in {401, 403}:
             raise BlackboardError(f"Authenticated session validation failed with HTTP {probe.status_code}.")
+        self.authenticated = True
 
     def get_deadlines(self) -> list[dict[str, Any]]:
         self.login()
         courses = self.fetch_courses()
+        scanned_courses = self.limit_courses(courses)
         deadlines = self.fetch_calendar_deadlines(courses)
-        deadlines.extend(self.deadlines_from_course_work(courses))
-        deadlines.extend(self.deadlines_from_announcements(courses))
-        deadlines.extend(self.fetch_html_deadlines(courses))
+        deadlines.extend(self.deadlines_from_course_work(scanned_courses))
+        deadlines.extend(self.deadlines_from_announcements(scanned_courses))
+        deadlines.extend(self.fetch_html_deadlines(scanned_courses))
         deadlines = self.dedupe_deadlines(deadlines)
+        if not deadlines:
+            deadlines = self.deadlines_from_course_index(courses)
 
         deadlines.sort(
             key=lambda item: (
@@ -295,8 +311,12 @@ class BlackboardClient:
 
     def download_assignment_file(self, course_id: str, content_id: str, file_id: str) -> dict[str, Any]:
         self.login()
-        content = self.fetch_content(course_id, content_id)
-        attachment = self.find_attachment(content, file_id)
+        attachment = None
+        try:
+            content = self.fetch_content(course_id, content_id)
+            attachment = self.find_attachment(content, file_id)
+        except BlackboardError:
+            attachment = None
         if attachment is None:
             attachment = self.find_attachment_from_html(course_id, content_id, file_id)
         if attachment is None:
@@ -401,6 +421,11 @@ class BlackboardClient:
             return selected
         return [{"course_id": course_id, "course_name": course_id}]
 
+    def limit_courses(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if COURSE_SCAN_LIMIT <= 0:
+            return courses
+        return courses[:COURSE_SCAN_LIMIT]
+
     def fetch_calendar_deadlines(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         course_names = {course["course_id"]: course.get("course_name") for course in courses}
         start = datetime.now(UTC)
@@ -486,6 +511,20 @@ class BlackboardClient:
                     }
                 )
         return deadlines
+
+    def deadlines_from_course_index(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "course_id": course.get("course_id"),
+                "course_name": course.get("course_name"),
+                "assignment_title": f"Course available: {course.get('course_name') or course.get('course_id')}",
+                "due_date": None,
+                "description": "Course was discovered, but no deadline was found in calendar, content, announcement, or HTML scans.",
+                "url": urljoin(BASE_URL, f"webapps/blackboard/execute/courseMain?course_id={course.get('course_id')}"),
+                "source": "course-index",
+            }
+            for course in courses
+        ]
 
     def fetch_course_work(self, course: dict[str, Any], include_files: bool = True) -> list[dict[str, Any]]:
         api_items = self.fetch_course_content_tree(course, include_files=include_files)
