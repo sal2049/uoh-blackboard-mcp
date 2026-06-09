@@ -12,7 +12,7 @@ pinned: false
 
 Private Model Context Protocol server for University of Ha'il Blackboard.
 
-This Docker Space exposes a FastMCP SSE endpoint for Poke or another personal assistant to read deadlines, download assignment files, and submit assignment files with credentials passed per request or stored privately as Space secrets.
+This Docker Space exposes a FastMCP SSE endpoint for Poke or another personal assistant to read courses, discover assignment-like content, download files, and submit assignment files with credentials passed per request or stored privately as Space secrets.
 
 ## MCP Endpoint
 
@@ -26,9 +26,17 @@ The container listens on `0.0.0.0:7860`, and Hugging Face routes public traffic 
 
 ## Tools
 
+### `list_courses`
+
+Lists active Blackboard courses and returns `course_id` values that the assistant can use in later calls.
+
+### `profile_scraper`
+
+Checks what the scraper can currently see across courses, assignment-like content, files, and announcements. This is useful when `get_deadlines` looks empty and the assistant needs to diagnose where Blackboard is hiding content.
+
 ### `get_deadlines`
 
-Reads active courses and upcoming assignments/deadlines from Blackboard.
+Reads active courses and upcoming assignments/deadlines from Blackboard using calendar APIs, course content APIs, announcements, and HTML fallback scans.
 
 Arguments:
 
@@ -52,6 +60,53 @@ Returns a JSON list with:
   "source": "api or html"
 }
 ```
+
+Items may include `content_id` and `files` when the deadline came from course content scanning.
+
+### `get_course_work`
+
+Discovers assignment-like course content, available dates, due dates, content IDs, and attachment metadata. Use this before downloading a file when the assistant does not already know the `content_id` or `file_id`.
+
+Arguments:
+
+```json
+{
+  "course_id": "optional",
+  "include_files": true,
+  "username": "optional Blackboard username",
+  "password": "optional Blackboard password"
+}
+```
+
+Returns items like:
+
+```json
+{
+  "course_id": "...",
+  "course_name": "...",
+  "content_id": "...",
+  "title": "...",
+  "kind": "assignment",
+  "content_type": "...",
+  "due_date": "...",
+  "available_date": "...",
+  "description": "...",
+  "url": "...",
+  "source": "content-api or html-content",
+  "files": [
+    {
+      "file_id": "...",
+      "file_name": "instructions.pdf",
+      "mime_type": "application/pdf",
+      "url": "..."
+    }
+  ]
+}
+```
+
+### `get_announcements`
+
+Reads Blackboard announcements, optionally for one course. Assignment reminders often appear here even when the calendar is empty.
 
 ### `download_assignment_file`
 

@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from mcp.server.fastmcp import FastMCP
 
-from server import download_assignment_file, get_deadlines, mcp, submit_assignment
+from server import (
+    download_assignment_file,
+    get_announcements,
+    get_course_work,
+    get_deadlines,
+    list_courses,
+    mcp,
+    profile_scraper,
+    submit_assignment,
+)
 
 
 if not isinstance(mcp, FastMCP):

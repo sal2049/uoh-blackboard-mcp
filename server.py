@@ -25,6 +25,24 @@ BASE_URL = "https://uoh.blackboard.com/"
 LOGIN_URL = urljoin(BASE_URL, "webapps/login/")
 LOOKAHEAD_DAYS = int(os.getenv("UOH_LOOKAHEAD_DAYS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("UOH_TIMEOUT", "25"))
+MAX_CONTENT_ITEMS_PER_COURSE = int(os.getenv("UOH_MAX_CONTENT_ITEMS_PER_COURSE", "250"))
+WORK_KEYWORDS = (
+    "assignment",
+    "assessment",
+    "homework",
+    "quiz",
+    "test",
+    "exam",
+    "turnitin",
+    "submission",
+    "submit",
+    "due",
+    "deadline",
+    "واجب",
+    "اختبار",
+    "تسليم",
+    "موعد",
+)
 
 
 class BlackboardError(RuntimeError):
@@ -180,8 +198,10 @@ class BlackboardClient:
         self.login()
         courses = self.fetch_courses()
         deadlines = self.fetch_calendar_deadlines(courses)
-        if not deadlines:
-            deadlines = self.fetch_html_deadlines(courses)
+        deadlines.extend(self.deadlines_from_course_work(courses))
+        deadlines.extend(self.deadlines_from_announcements(courses))
+        deadlines.extend(self.fetch_html_deadlines(courses))
+        deadlines = self.dedupe_deadlines(deadlines)
 
         deadlines.sort(
             key=lambda item: (
@@ -192,6 +212,50 @@ class BlackboardClient:
             )
         )
         return deadlines
+
+    def list_courses(self) -> list[dict[str, Any]]:
+        self.login()
+        return self.fetch_courses()
+
+    def get_course_work(self, course_id: str | None = None, include_files: bool = True) -> list[dict[str, Any]]:
+        self.login()
+        courses = self.select_courses(course_id)
+        work: list[dict[str, Any]] = []
+        for course in courses:
+            work.extend(self.fetch_course_work(course, include_files=include_files))
+        return self.dedupe_work(work)
+
+    def get_announcements(self, course_id: str | None = None) -> list[dict[str, Any]]:
+        self.login()
+        announcements: list[dict[str, Any]] = []
+        for course in self.select_courses(course_id):
+            announcements.extend(self.fetch_course_announcements(course))
+        return announcements
+
+    def profile_scraper(self) -> dict[str, Any]:
+        self.login()
+        courses = self.fetch_courses()
+        course_summaries = []
+        for course in courses:
+            work = self.fetch_course_work(course, include_files=True)
+            announcements = self.fetch_course_announcements(course)
+            course_summaries.append(
+                {
+                    "course_id": course.get("course_id"),
+                    "course_name": course.get("course_name"),
+                    "work_items_found": len(work),
+                    "items_with_due_dates": sum(1 for item in work if item.get("due_date")),
+                    "files_found": sum(len(item.get("files") or []) for item in work),
+                    "announcements_found": len(announcements),
+                }
+            )
+        return {
+            "status": "ok",
+            "courses_found": len(courses),
+            "lookahead_days": LOOKAHEAD_DAYS,
+            "max_content_items_per_course": MAX_CONTENT_ITEMS_PER_COURSE,
+            "courses": course_summaries,
+        }
 
     def download_assignment_file(self, course_id: str, content_id: str, file_id: str) -> dict[str, Any]:
         self.login()
@@ -292,6 +356,15 @@ class BlackboardClient:
                 courses.append({"course_id": course_id, "course_name": clean_text(link.get_text(" ")) or course_id})
         return courses
 
+    def select_courses(self, course_id: str | None = None) -> list[dict[str, Any]]:
+        courses = self.fetch_courses()
+        if not course_id:
+            return courses
+        selected = [course for course in courses if str(course.get("course_id")) == str(course_id)]
+        if selected:
+            return selected
+        return [{"course_id": course_id, "course_name": course_id}]
+
     def fetch_calendar_deadlines(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         course_names = {course["course_id"]: course.get("course_name") for course in courses}
         start = datetime.now(UTC)
@@ -335,6 +408,280 @@ class BlackboardClient:
                     continue
                 deadlines.extend(self.parse_deadlines_from_html(response.text, response.url, course))
         return self.dedupe_deadlines(deadlines)
+
+    def deadlines_from_course_work(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deadlines: list[dict[str, Any]] = []
+        for course in courses:
+            for item in self.fetch_course_work(course, include_files=True):
+                if not item.get("due_date") and item.get("kind") not in {"assignment", "assessment"}:
+                    continue
+                deadlines.append(
+                    {
+                        "course_id": item.get("course_id"),
+                        "course_name": item.get("course_name"),
+                        "assignment_title": item.get("title"),
+                        "due_date": item.get("due_date"),
+                        "description": item.get("description"),
+                        "url": item.get("url"),
+                        "source": item.get("source"),
+                        "content_id": item.get("content_id"),
+                        "content_type": item.get("content_type"),
+                        "files": item.get("files", []),
+                    }
+                )
+        return deadlines
+
+    def deadlines_from_announcements(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        deadlines: list[dict[str, Any]] = []
+        for course in courses:
+            for announcement in self.fetch_course_announcements(course):
+                text = f"{announcement.get('title', '')} {announcement.get('body', '')}"
+                if not self.looks_like_work(text):
+                    continue
+                deadlines.append(
+                    {
+                        "course_id": announcement.get("course_id"),
+                        "course_name": announcement.get("course_name"),
+                        "assignment_title": announcement.get("title"),
+                        "due_date": find_date_like_text(text),
+                        "description": clean_text(announcement.get("body"))[:1200],
+                        "url": announcement.get("url"),
+                        "source": "announcement",
+                    }
+                )
+        return deadlines
+
+    def fetch_course_work(self, course: dict[str, Any], include_files: bool = True) -> list[dict[str, Any]]:
+        api_items = self.fetch_course_content_tree(course, include_files=include_files)
+        html_items = self.fetch_course_work_from_html(course, include_files=include_files)
+        return self.dedupe_work(api_items + html_items)
+
+    def fetch_course_content_tree(self, course: dict[str, Any], include_files: bool = True) -> list[dict[str, Any]]:
+        course_id = str(course["course_id"])
+        candidates = (
+            f"learn/api/public/v1/courses/{course_id}/contents?limit=100",
+            f"learn/api/public/v1/courses/{course_id}/contents?recursive=true&limit=100",
+            f"learn/api/v1/courses/{course_id}/contents?limit=100",
+        )
+        raw_items: list[dict[str, Any]] = []
+        queue: list[tuple[str | None, str]] = [(None, path) for path in candidates]
+        seen_urls: set[str] = set()
+        seen_content_ids: set[str] = set()
+
+        while queue and len(raw_items) < MAX_CONTENT_ITEMS_PER_COURSE:
+            parent_id, path = queue.pop(0)
+            url = urljoin(BASE_URL, path)
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                response = self.get(url, accept_json=True)
+            except requests.RequestException:
+                continue
+            body = safe_json(response)
+            items = extract_list(body)
+            for item in items:
+                content_id = self.extract_content_id_from_value(item) or parent_id
+                if content_id and content_id in seen_content_ids:
+                    continue
+                if content_id:
+                    seen_content_ids.add(content_id)
+                raw_items.append(item)
+                if content_id:
+                    queue.extend(
+                        [
+                            (
+                                content_id,
+                                f"learn/api/public/v1/courses/{course_id}/contents/{content_id}/children?limit=100",
+                            ),
+                            (
+                                content_id,
+                                f"learn/api/v1/courses/{course_id}/contents/{content_id}/children?limit=100",
+                            ),
+                        ]
+                    )
+
+        normalized = []
+        for item in raw_items:
+            work_item = self.normalize_content_item(item, course, include_files=include_files)
+            if work_item and (self.looks_like_work(json.dumps(item, ensure_ascii=False)) or work_item.get("files")):
+                normalized.append(work_item)
+        return normalized
+
+    def fetch_course_work_from_html(self, course: dict[str, Any], include_files: bool = True) -> list[dict[str, Any]]:
+        course_id = str(course["course_id"])
+        urls = (
+            urljoin(BASE_URL, f"ultra/courses/{course_id}/outline"),
+            urljoin(BASE_URL, f"webapps/blackboard/execute/courseMain?course_id={course_id}"),
+            urljoin(BASE_URL, f"webapps/blackboard/content/listContent.jsp?course_id={course_id}"),
+        )
+        items: list[dict[str, Any]] = []
+        seen_pages: set[str] = set()
+        pages_to_scan = list(urls)
+        while pages_to_scan and len(seen_pages) < 25:
+            url = pages_to_scan.pop(0)
+            if url in seen_pages:
+                continue
+            seen_pages.add(url)
+            try:
+                response = self.get(url)
+            except requests.RequestException:
+                continue
+            soup = BeautifulSoup(response.text, "html.parser")
+            page_items = self.parse_work_from_html(response.text, response.url, course, include_files=include_files)
+            items.extend(page_items)
+            for link in soup.find_all("a", href=True):
+                href = urljoin(response.url, unescape(link["href"]))
+                if self.extract_content_id(href) and href not in seen_pages:
+                    pages_to_scan.append(href)
+        return items
+
+    def parse_work_from_html(
+        self,
+        html: str,
+        page_url: str,
+        course: dict[str, Any],
+        include_files: bool = True,
+    ) -> list[dict[str, Any]]:
+        soup = BeautifulSoup(html, "html.parser")
+        items: list[dict[str, Any]] = []
+        for node in soup.find_all(["li", "tr", "article", "section", "div"], limit=1500):
+            text = clean_text(node.get_text(" "))
+            link = node.find("a", href=True)
+            href = urljoin(page_url, unescape(link["href"])) if link else page_url
+            if not text or (not self.looks_like_work(text) and not self.looks_like_file_link(href, text)):
+                continue
+            files = self.extract_files_from_html_node(node, page_url) if include_files else []
+            title = clean_text(link.get_text(" ")) if link else text[:100]
+            items.append(
+                {
+                    "course_id": course["course_id"],
+                    "course_name": course.get("course_name"),
+                    "content_id": self.extract_content_id(href),
+                    "title": title or "Course content",
+                    "kind": self.classify_work(text, href),
+                    "content_type": "html",
+                    "due_date": find_date_like_text(text),
+                    "available_date": None,
+                    "description": text[:1600],
+                    "url": href,
+                    "source": "html-content",
+                    "files": files,
+                }
+            )
+        return items
+
+    def normalize_content_item(
+        self,
+        item: dict[str, Any],
+        course: dict[str, Any],
+        include_files: bool = True,
+    ) -> dict[str, Any] | None:
+        title = first_present(item.get("title"), item.get("name"), item.get("displayName"), item.get("label"))
+        description = first_present(item.get("description"), item.get("body"), item.get("text"), item.get("instructions"), "")
+        text_blob = clean_text(BeautifulSoup(str(description), "html.parser").get_text(" "))
+        content_id = self.extract_content_id_from_value(item)
+        url = self.content_url(item, course["course_id"], content_id)
+        if not title and not text_blob and not url:
+            return None
+
+        due_date = first_present(
+            item.get("dueDate"),
+            item.get("due_date"),
+            item.get("deadline"),
+            item.get("dateDue"),
+            self.find_value(item, ("dueDate", "due_date", "deadline", "dateDue")),
+            find_date_like_text(f"{title or ''} {text_blob}"),
+        )
+        available_date = first_present(
+            item.get("created"),
+            item.get("createdAt"),
+            item.get("start"),
+            item.get("availableFrom"),
+            self.find_value(item, ("availableFrom", "created", "createdAt", "start")),
+        )
+        raw_type = clean_text(first_present(item.get("contentHandler"), item.get("contentType"), item.get("type"), item.get("resourceType"), ""))
+        files = self.extract_attachments(item) if include_files else []
+        return {
+            "course_id": course["course_id"],
+            "course_name": course.get("course_name"),
+            "content_id": content_id,
+            "title": clean_text(title or text_blob[:100] or "Course content"),
+            "kind": self.classify_work(f"{title or ''} {text_blob} {raw_type}", url or ""),
+            "content_type": raw_type or None,
+            "due_date": due_date,
+            "available_date": available_date,
+            "description": text_blob[:1600],
+            "url": url,
+            "source": "content-api",
+            "files": files,
+        }
+
+    def fetch_course_announcements(self, course: dict[str, Any]) -> list[dict[str, Any]]:
+        course_id = str(course["course_id"])
+        announcements: list[dict[str, Any]] = []
+        for path in (
+            f"learn/api/public/v1/courses/{course_id}/announcements?limit=100",
+            f"learn/api/v1/courses/{course_id}/announcements?limit=100",
+        ):
+            try:
+                response = self.get(urljoin(BASE_URL, path), accept_json=True)
+            except requests.RequestException:
+                continue
+            for item in extract_list(safe_json(response)):
+                title = first_present(item.get("title"), item.get("subject"), item.get("name"), "Announcement")
+                body = first_present(item.get("body"), item.get("message"), item.get("description"), "")
+                url = first_present(item.get("url"), item.get("webUrl"), self.attachment_url(item))
+                announcements.append(
+                    {
+                        "course_id": course_id,
+                        "course_name": course.get("course_name"),
+                        "announcement_id": first_present(item.get("id"), item.get("announcementId")),
+                        "title": clean_text(title),
+                        "body": clean_text(BeautifulSoup(str(body), "html.parser").get_text(" "))[:2000],
+                        "created": first_present(item.get("created"), item.get("createdAt"), item.get("postedDate")),
+                        "url": urljoin(BASE_URL, str(url)) if url else None,
+                        "source": "announcements-api",
+                    }
+                )
+        if announcements:
+            return announcements
+        return self.fetch_announcements_from_html(course)
+
+    def fetch_announcements_from_html(self, course: dict[str, Any]) -> list[dict[str, Any]]:
+        course_id = str(course["course_id"])
+        urls = (
+            urljoin(BASE_URL, f"webapps/blackboard/execute/announcement?method=search&context=course_entry&course_id={course_id}"),
+            urljoin(BASE_URL, f"ultra/courses/{course_id}/announcements"),
+        )
+        announcements: list[dict[str, Any]] = []
+        for url in urls:
+            try:
+                response = self.get(url)
+            except requests.RequestException:
+                continue
+            soup = BeautifulSoup(response.text, "html.parser")
+            for node in soup.find_all(["li", "article", "div"], limit=700):
+                text = clean_text(node.get_text(" "))
+                if len(text) < 20:
+                    continue
+                link = node.find("a", href=True)
+                title = clean_text(link.get_text(" ")) if link else text[:100]
+                if not re.search(r"\b(announcement|posted|course|assignment|واجب|اعلان|إعلان)\b", text, re.I):
+                    continue
+                announcements.append(
+                    {
+                        "course_id": course_id,
+                        "course_name": course.get("course_name"),
+                        "announcement_id": self.extract_content_id(link["href"]) if link else None,
+                        "title": title,
+                        "body": text[:2000],
+                        "created": find_date_like_text(text),
+                        "url": urljoin(response.url, link["href"]) if link else response.url,
+                        "source": "announcements-html",
+                    }
+                )
+        return announcements
 
     def parse_deadlines_from_html(self, html: str, page_url: str, course: dict[str, Any]) -> list[dict[str, Any]]:
         soup = BeautifulSoup(html, "html.parser")
@@ -456,6 +803,163 @@ class BlackboardClient:
             for child in value:
                 nodes.extend(self.walk_json(child))
         return nodes
+
+    def extract_attachments(self, value: Any) -> list[dict[str, Any]]:
+        attachments: list[dict[str, Any]] = []
+        seen: set[tuple[str | None, str | None]] = set()
+        for node in self.walk_json(value):
+            if not isinstance(node, dict):
+                continue
+            url = self.attachment_url(node)
+            file_name = first_present(node.get("fileName"), node.get("filename"), node.get("name"), node.get("title"))
+            file_id = first_present(
+                node.get("id"),
+                node.get("fileId"),
+                node.get("file_id"),
+                node.get("attachmentId"),
+                self.extract_file_id(str(url or "")),
+            )
+            if not url and not file_name:
+                continue
+            if not self.looks_like_file_link(str(url or ""), str(file_name or "")):
+                continue
+            key = (str(file_id) if file_id else None, str(url) if url else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            attachments.append(
+                {
+                    "file_id": str(file_id) if file_id else str(file_name or url),
+                    "file_name": clean_text(file_name or Path(urlparse(str(url)).path).name or "attachment"),
+                    "mime_type": first_present(node.get("mimeType"), node.get("contentType"), node.get("mediaType")),
+                    "url": urljoin(BASE_URL, str(url)) if url else None,
+                }
+            )
+        return attachments
+
+    def extract_files_from_html_node(self, node: Any, page_url: str) -> list[dict[str, Any]]:
+        files: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for link in node.find_all("a", href=True):
+            href = urljoin(page_url, unescape(link["href"]))
+            text = clean_text(link.get_text(" "))
+            if not self.looks_like_file_link(href, text):
+                continue
+            file_id = self.extract_file_id(href) or text or href
+            if str(file_id) in seen:
+                continue
+            seen.add(str(file_id))
+            files.append(
+                {
+                    "file_id": str(file_id),
+                    "file_name": text or Path(urlparse(href).path).name or str(file_id),
+                    "mime_type": mimetypes.guess_type(text or href)[0],
+                    "url": href,
+                }
+            )
+        return files
+
+    def content_url(self, item: dict[str, Any], course_id: str, content_id: str | None) -> str | None:
+        url = first_present(item.get("url"), item.get("href"), item.get("webUrl"), item.get("launchUrl"), self.attachment_url(item))
+        if url:
+            return urljoin(BASE_URL, str(url))
+        if content_id:
+            return urljoin(BASE_URL, f"webapps/blackboard/content/listContent.jsp?course_id={course_id}&content_id={content_id}")
+        return None
+
+    def extract_content_id_from_value(self, value: Any) -> str | None:
+        if isinstance(value, dict):
+            content_id = first_present(
+                value.get("id"),
+                value.get("contentId"),
+                value.get("content_id"),
+                value.get("itemId"),
+                value.get("item_id"),
+            )
+            if content_id:
+                return str(content_id)
+            for key in ("url", "href", "webUrl", "launchUrl"):
+                if isinstance(value.get(key), str):
+                    content_id = self.extract_content_id(value[key])
+                    if content_id:
+                        return content_id
+        elif isinstance(value, str):
+            return self.extract_content_id(value)
+        return None
+
+    def extract_content_id(self, value: str) -> str | None:
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query)
+        for key in ("content_id", "contentId", "item_id", "itemId", "assessment_id", "assessmentId"):
+            if query.get(key):
+                return query[key][0]
+        for pattern in (
+            r"/contents/([^/?#]+)",
+            r"/content/([^/?#]+)",
+            r"/outline/(?:assessment|file|content)/([^/?#]+)",
+            r"content_id=([^&#]+)",
+            r"contentId=([^&#]+)",
+        ):
+            match = re.search(pattern, value)
+            if match:
+                return match.group(1)
+        return None
+
+    def extract_file_id(self, value: str) -> str | None:
+        parsed = urlparse(value)
+        query = parse_qs(parsed.query)
+        for key in ("file_id", "fileId", "attachment_id", "attachmentId", "xid"):
+            if query.get(key):
+                return query[key][0]
+        for pattern in (
+            r"/files/([^/?#]+)",
+            r"/attachments/([^/?#]+)",
+            r"file_id=([^&#]+)",
+            r"fileId=([^&#]+)",
+            r"xid=([^&#]+)",
+        ):
+            match = re.search(pattern, value)
+            if match:
+                return match.group(1)
+        return None
+
+    def looks_like_work(self, text: str) -> bool:
+        return any(keyword.lower() in clean_text(text).lower() for keyword in WORK_KEYWORDS)
+
+    def looks_like_file_link(self, href: str, text: str) -> bool:
+        combined = f"{href} {text}".lower()
+        if re.search(r"\.(pdf|docx?|pptx?|xlsx?|csv|txt|zip|rar|png|jpe?g)(?:[?#]|$)", combined):
+            return True
+        return any(marker in combined for marker in ("download", "attachment", "bbcswebdav", "file", "resource/x-bb-file"))
+
+    def classify_work(self, text: str, url: str = "") -> str:
+        combined = f"{text} {url}".lower()
+        if any(word in combined for word in ("assignment", "homework", "submit", "submission", "turnitin", "واجب", "تسليم")):
+            return "assignment"
+        if any(word in combined for word in ("quiz", "test", "exam", "assessment", "اختبار")):
+            return "assessment"
+        if self.looks_like_file_link(url, text):
+            return "file"
+        return "content"
+
+    def dedupe_work(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        seen: set[tuple[Any, Any, Any, Any]] = set()
+        unique: list[dict[str, Any]] = []
+        for item in items:
+            key = (item.get("course_id"), item.get("content_id"), item.get("title"), item.get("url"))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        unique.sort(
+            key=lambda item: (
+                parse_datetime(item.get("due_date")) is None,
+                parse_datetime(item.get("due_date")) or datetime.max.replace(tzinfo=UTC),
+                item.get("course_name") or "",
+                item.get("title") or "",
+            )
+        )
+        return unique
 
     def build_login_payload(self, form: Any) -> dict[str, str]:
         payload: dict[str, str] = {}
@@ -590,8 +1094,37 @@ app = mcp.sse_app()
 
 @mcp.tool()
 def get_deadlines(username: str | None = None, password: str | None = None) -> str:
-    """Read active UoH Blackboard deadlines and upcoming assignments."""
+    """Read active UoH Blackboard deadlines and upcoming assignment-like items."""
     return json_response(BlackboardClient(username, password).get_deadlines())
+
+
+@mcp.tool()
+def list_courses(username: str | None = None, password: str | None = None) -> str:
+    """List active Blackboard courses so an assistant can choose a course_id."""
+    return json_response(BlackboardClient(username, password).list_courses())
+
+
+@mcp.tool()
+def get_course_work(
+    course_id: str | None = None,
+    include_files: bool = True,
+    username: str | None = None,
+    password: str | None = None,
+) -> str:
+    """List assignment-like course content, due dates, content IDs, and file IDs."""
+    return json_response(BlackboardClient(username, password).get_course_work(course_id, include_files))
+
+
+@mcp.tool()
+def get_announcements(course_id: str | None = None, username: str | None = None, password: str | None = None) -> str:
+    """Read Blackboard announcements, optionally for one course."""
+    return json_response(BlackboardClient(username, password).get_announcements(course_id))
+
+
+@mcp.tool()
+def profile_scraper(username: str | None = None, password: str | None = None) -> str:
+    """Report what the scraper can currently see across courses, work items, files, and announcements."""
+    return json_response(BlackboardClient(username, password).profile_scraper())
 
 
 @mcp.tool()
