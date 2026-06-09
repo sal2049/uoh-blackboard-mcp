@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 try:
     from dotenv import load_dotenv
@@ -26,7 +27,6 @@ LOGIN_URL = urljoin(BASE_URL, "webapps/login/")
 LOOKAHEAD_DAYS = int(os.getenv("UOH_LOOKAHEAD_DAYS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("UOH_TIMEOUT", "25"))
 MAX_CONTENT_ITEMS_PER_COURSE = int(os.getenv("UOH_MAX_CONTENT_ITEMS_PER_COURSE", "250"))
-ALLOW_SERVER_CREDENTIALS = os.getenv("UOH_ALLOW_SERVER_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
 WORK_KEYWORDS = (
     "assignment",
     "assessment",
@@ -48,6 +48,28 @@ WORK_KEYWORDS = (
 
 class BlackboardError(RuntimeError):
     """Raised for Blackboard authentication, parsing, and API failures."""
+
+
+class SseFlushMiddleware:
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/sse":
+            await self.app(scope, receive, send)
+            return
+
+        injected = False
+
+        async def send_with_padding(message: dict[str, Any]) -> None:
+            nonlocal injected
+            await send(message)
+            if message.get("type") == "http.response.start" and not injected:
+                injected = True
+                padding = b":" + (b" " * 4096) + b"\n\n"
+                await send({"type": "http.response.body", "body": padding, "more_body": True})
+
+        await self.app(scope, receive, send_with_padding)
 
 
 def json_response(payload: Any) -> str:
@@ -144,6 +166,10 @@ def short_response(response: requests.Response) -> str:
     return clean_text(response.text)[:2000]
 
 
+def env_flag(name: str, default: str = "false") -> bool:
+    return os.getenv(name, default).lower() in {"1", "true", "yes", "on"}
+
+
 class BlackboardClient:
     def __init__(self, username: str | None = None, password: str | None = None) -> None:
         if load_dotenv is not None:
@@ -151,7 +177,7 @@ class BlackboardClient:
 
         self.username = username
         self.password = password
-        if ALLOW_SERVER_CREDENTIALS and (not self.username or not self.password):
+        if env_flag("UOH_ALLOW_SERVER_CREDENTIALS") and (not self.username or not self.password):
             self.username = self.username or os.getenv("UOH_USER")
             self.password = self.password or os.getenv("UOH_PASS")
         if not self.username or not self.password:
@@ -1096,7 +1122,7 @@ mcp = FastMCP(
     sse_path="/sse",
     message_path="/messages/",
 )
-app = mcp.sse_app()
+app = SseFlushMiddleware(mcp.sse_app())
 
 
 @mcp.tool()

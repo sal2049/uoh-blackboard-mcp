@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 downloads/
 .cache/
+.tools/
+run_local.log
+run_local.pid
