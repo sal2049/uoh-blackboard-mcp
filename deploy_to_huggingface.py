@@ -11,6 +11,7 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 FILES_TO_INCLUDE = [
     "README.md",
     "Dockerfile",
+    "app.py",
     "server.py",
     "requirements.txt",
 ]
@@ -29,9 +30,10 @@ def main() -> int:
 
     env = {**os.environ, "HF_TOKEN": token}
     try:
+        hf_bin = "hf"
         run(
             [
-                "hf",
+                hf_bin,
                 "repos",
                 "create",
                 space_id,
@@ -45,7 +47,7 @@ def main() -> int:
         )
         run(
             [
-                "hf",
+                hf_bin,
                 "upload",
                 space_id,
                 ".",
