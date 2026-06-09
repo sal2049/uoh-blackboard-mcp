@@ -31,6 +31,7 @@ LOOKAHEAD_DAYS = int(os.getenv("UOH_LOOKAHEAD_DAYS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("UOH_TIMEOUT", "25"))
 MAX_CONTENT_ITEMS_PER_COURSE = int(os.getenv("UOH_MAX_CONTENT_ITEMS_PER_COURSE", "250"))
 COURSE_SCAN_LIMIT = int(os.getenv("UOH_COURSE_SCAN_LIMIT", "25"))
+DEADLINE_FAST_COURSE_SCAN_LIMIT = int(os.getenv("UOH_DEADLINE_FAST_COURSE_SCAN_LIMIT", "8"))
 SSE_FLUSH_BYTES = int(os.getenv("UOH_SSE_FLUSH_BYTES", "131072"))
 WORK_KEYWORDS = (
     "assignment",
@@ -243,17 +244,22 @@ class BlackboardClient:
             raise BlackboardError(f"Authenticated session validation failed with HTTP {probe.status_code}.")
         self.authenticated = True
 
-    def get_deadlines(self) -> list[dict[str, Any]]:
+    def get_deadlines(self, deep_scan: bool = False, course_scan_limit: int | None = None) -> list[dict[str, Any]]:
         self.login()
         courses = self.fetch_courses()
-        scanned_courses = self.limit_courses(courses)
+        scan_limit = course_scan_limit
+        if scan_limit is None:
+            scan_limit = COURSE_SCAN_LIMIT if deep_scan else DEADLINE_FAST_COURSE_SCAN_LIMIT
+        scanned_courses = self.limit_courses(courses, scan_limit)
         deadlines = self.fetch_calendar_deadlines(courses)
         deadlines.extend(self.deadlines_from_course_work(scanned_courses))
-        deadlines.extend(self.deadlines_from_announcements(scanned_courses))
-        deadlines.extend(self.fetch_html_deadlines(scanned_courses))
+        if deep_scan:
+            deadlines.extend(self.deadlines_from_announcements(scanned_courses))
+            deadlines.extend(self.fetch_html_deadlines(scanned_courses))
         deadlines = self.dedupe_deadlines(deadlines)
         if not deadlines:
-            deadlines = self.deadlines_from_course_index(courses)
+            fallback_limit = 0 if scan_limit <= 0 else max(scan_limit, 10)
+            deadlines = self.deadlines_from_course_index(self.limit_courses(courses, fallback_limit))
 
         deadlines.sort(
             key=lambda item: (
@@ -306,6 +312,7 @@ class BlackboardClient:
             "courses_found": len(courses),
             "lookahead_days": LOOKAHEAD_DAYS,
             "max_content_items_per_course": MAX_CONTENT_ITEMS_PER_COURSE,
+            "deadline_fast_course_scan_limit": DEADLINE_FAST_COURSE_SCAN_LIMIT,
             "courses": course_summaries,
         }
 
@@ -421,10 +428,12 @@ class BlackboardClient:
             return selected
         return [{"course_id": course_id, "course_name": course_id}]
 
-    def limit_courses(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if COURSE_SCAN_LIMIT <= 0:
+    def limit_courses(self, courses: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
+        if limit is None:
+            limit = COURSE_SCAN_LIMIT
+        if limit <= 0:
             return courses
-        return courses[:COURSE_SCAN_LIMIT]
+        return courses[:limit]
 
     def fetch_calendar_deadlines(self, courses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         course_names = {course["course_id"]: course.get("course_name") for course in courses}
@@ -1168,9 +1177,18 @@ app = SseFlushMiddleware(mcp.sse_app())
 
 
 @mcp.tool()
-def get_deadlines(username: str | None = None, password: str | None = None) -> str:
-    """Read active UoH Blackboard deadlines and upcoming assignment-like items."""
-    return json_response(BlackboardClient(username, password).get_deadlines())
+def get_deadlines(
+    username: str | None = None,
+    password: str | None = None,
+    deep_scan: bool = False,
+    course_scan_limit: int | None = None,
+) -> str:
+    """Read UoH Blackboard deadlines and assignment-like items.
+
+    The default mode is optimized for personal-assistant calls over SSE. Use
+    deep_scan=True when you want slower announcement and HTML fallback scans.
+    """
+    return json_response(BlackboardClient(username, password).get_deadlines(deep_scan, course_scan_limit))
 
 
 @mcp.tool()
