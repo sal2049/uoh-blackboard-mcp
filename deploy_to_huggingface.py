@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import shutil
 import subprocess
 import sys
 
@@ -30,7 +31,7 @@ def main() -> int:
 
     env = {**os.environ, "HF_TOKEN": token}
     try:
-        hf_bin = "hf"
+        hf_bin = shutil.which("hf") or os.path.expanduser("~/.local/bin/hf")
         run(
             [
                 hf_bin,
