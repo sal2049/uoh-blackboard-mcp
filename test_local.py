@@ -39,7 +39,7 @@ def require_credentials() -> tuple[str, str]:
     if not username or not password:
         raise SystemExit(
             "Missing local Blackboard credentials. Create a .env file in this project with "
-            "UOH_USER and UOH_PASS before running this test."
+            "UOH_USER and UOH_PASS before running this test. Use .env.example as the template."
         )
     return username, password
 
