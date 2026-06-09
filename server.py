@@ -26,6 +26,7 @@ LOGIN_URL = urljoin(BASE_URL, "webapps/login/")
 LOOKAHEAD_DAYS = int(os.getenv("UOH_LOOKAHEAD_DAYS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("UOH_TIMEOUT", "25"))
 MAX_CONTENT_ITEMS_PER_COURSE = int(os.getenv("UOH_MAX_CONTENT_ITEMS_PER_COURSE", "250"))
+ALLOW_SERVER_CREDENTIALS = os.getenv("UOH_ALLOW_SERVER_CREDENTIALS", "false").lower() in {"1", "true", "yes", "on"}
 WORK_KEYWORDS = (
     "assignment",
     "assessment",
@@ -148,10 +149,16 @@ class BlackboardClient:
         if load_dotenv is not None:
             load_dotenv()
 
-        self.username = username or os.getenv("UOH_USER")
-        self.password = password or os.getenv("UOH_PASS")
+        self.username = username
+        self.password = password
+        if ALLOW_SERVER_CREDENTIALS and (not self.username or not self.password):
+            self.username = self.username or os.getenv("UOH_USER")
+            self.password = self.password or os.getenv("UOH_PASS")
         if not self.username or not self.password:
-            raise BlackboardError("Missing Blackboard credentials. Pass username/password or set UOH_USER and UOH_PASS.")
+            raise BlackboardError(
+                "Missing Blackboard credentials. Pass username/password to this tool. "
+                "Server-stored UOH_USER/UOH_PASS are disabled unless UOH_ALLOW_SERVER_CREDENTIALS=true."
+            )
 
         self.session = requests.Session()
         self.session.headers.update(

@@ -12,7 +12,9 @@ pinned: false
 
 Private Model Context Protocol server for University of Ha'il Blackboard.
 
-This Docker Space exposes a FastMCP SSE endpoint for Poke or another personal assistant to read courses, discover assignment-like content, download files, and submit assignment files with credentials passed per request or stored privately as Space secrets.
+This Docker Space exposes a FastMCP SSE endpoint for Poke or another personal assistant to read courses, discover assignment-like content, download files, and submit assignment files.
+
+For hosted Spaces, the safe default is that each MCP call must pass Blackboard credentials explicitly. Server-stored credentials are disabled unless `UOH_ALLOW_SERVER_CREDENTIALS=true` is set.
 
 ## MCP Endpoint
 
@@ -168,13 +170,29 @@ Returns:
 
 If Blackboard rejects the submission endpoint or requires a different workflow, the tool returns `status: "failed"` with Blackboard's response details.
 
-## Secrets
+## Credential Safety
 
-Do not commit Blackboard credentials. For Hugging Face Spaces, add these as private secrets:
+Do not commit Blackboard credentials.
+
+If this Space is public, do not set `UOH_USER` and `UOH_PASS` as active server credentials. Anyone who can reach a public MCP endpoint could call the tools.
+
+Safe default for public or shared Spaces:
+
+- Keep `UOH_ALLOW_SERVER_CREDENTIALS` unset or set to `false`.
+- Have each user pass `username` and `password` in the MCP tool call.
+
+Private single-user mode:
+
+- Make the Hugging Face Space private.
+- Add `UOH_USER` and `UOH_PASS` as private Space secrets.
+- Add `UOH_ALLOW_SERVER_CREDENTIALS=true` as a private Space secret.
+
+Private Space secrets:
 
 ```text
 UOH_USER=your_blackboard_username
 UOH_PASS=your_blackboard_password
+UOH_ALLOW_SERVER_CREDENTIALS=true
 ```
 
 Optional secrets:
@@ -184,7 +202,7 @@ UOH_TIMEOUT=25
 UOH_LOOKAHEAD_DAYS=120
 ```
 
-The tools can also accept `username` and `password` directly from the MCP client. Explicit tool arguments take priority over secrets.
+Explicit tool arguments always take priority over server secrets.
 
 ## Local Test
 
@@ -208,6 +226,7 @@ docker build -t blackboard-mcp .
 docker run --rm -p 7860:7860 \
   -e UOH_USER=your_blackboard_username \
   -e UOH_PASS=your_blackboard_password \
+  -e UOH_ALLOW_SERVER_CREDENTIALS=true \
   blackboard-mcp
 ```
 
