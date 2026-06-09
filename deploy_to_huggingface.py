@@ -46,21 +46,21 @@ def main() -> int:
             ],
             env=env,
         )
-        run(
-            [
-                hf_bin,
-                "upload",
-                space_id,
-                ".",
-                "--type",
-                "space",
-                "--include",
-                ",".join(FILES_TO_INCLUDE),
-                "--commit-message",
-                "Deploy Blackboard MCP Docker Space",
-            ],
-            env=env,
-        )
+        for file_name in FILES_TO_INCLUDE:
+            run(
+                [
+                    hf_bin,
+                    "upload",
+                    space_id,
+                    file_name,
+                    file_name,
+                    "--type",
+                    "space",
+                    "--commit-message",
+                    "Deploy Blackboard MCP Docker Space",
+                ],
+                env=env,
+            )
     except FileNotFoundError:
         print("The `hf` CLI is not installed. Install it with: curl -LsSf https://hf.co/cli/install.sh | bash -s", file=sys.stderr)
         return 1
