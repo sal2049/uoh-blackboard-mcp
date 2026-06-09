@@ -27,6 +27,7 @@ LOGIN_URL = urljoin(BASE_URL, "webapps/login/")
 LOOKAHEAD_DAYS = int(os.getenv("UOH_LOOKAHEAD_DAYS", "120"))
 REQUEST_TIMEOUT = int(os.getenv("UOH_TIMEOUT", "25"))
 MAX_CONTENT_ITEMS_PER_COURSE = int(os.getenv("UOH_MAX_CONTENT_ITEMS_PER_COURSE", "250"))
+SSE_FLUSH_BYTES = int(os.getenv("UOH_SSE_FLUSH_BYTES", "131072"))
 WORK_KEYWORDS = (
     "assignment",
     "assessment",
@@ -60,13 +61,15 @@ class SseFlushMiddleware:
             return
 
         injected = False
+        padding = b":" + (b" " * max(SSE_FLUSH_BYTES, 0)) + b"\n\n"
 
         async def send_with_padding(message: dict[str, Any]) -> None:
             nonlocal injected
             await send(message)
             if message.get("type") == "http.response.start" and not injected:
                 injected = True
-                padding = b":" + (b" " * 4096) + b"\n\n"
+                await send({"type": "http.response.body", "body": padding, "more_body": True})
+            elif message.get("type") == "http.response.body" and message.get("more_body") and message.get("body"):
                 await send({"type": "http.response.body", "body": padding, "more_body": True})
 
         await self.app(scope, receive, send_with_padding)
